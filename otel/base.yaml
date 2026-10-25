@@ -1,0 +1,8 @@
+# Shared part: every service sends OTLP here. The destination is picked by TELEMETRY=<file> in .env.
+receivers:
+  otlp:
+    protocols:
+      grpc: { endpoint: 0.0.0.0:4317 }
+      http: { endpoint: 0.0.0.0:4318 }
+processors:
+  batch: {}

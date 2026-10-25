@@ -1,0 +1,9 @@
+# Grafana LGTM (Loki logs, Tempo traces, Prometheus metrics) on http://localhost:3300
+exporters:
+  otlp_http/lgtm:
+    endpoint: http://lgtm:4318
+service:
+  pipelines:
+    traces:  { receivers: [otlp], processors: [batch], exporters: [otlp_http/lgtm] }
+    metrics: { receivers: [otlp], processors: [batch], exporters: [otlp_http/lgtm] }
+    logs:    { receivers: [otlp], processors: [batch], exporters: [otlp_http/lgtm] }

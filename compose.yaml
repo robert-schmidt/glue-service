@@ -1,0 +1,114 @@
+name: glue-demo
+
+# OpenTelemetry Java agent attached from outside: no code change in the legacy systems.
+x-otel-java: &otel-java
+  JAVA_TOOL_OPTIONS: -javaagent:/otel/opentelemetry-javaagent.jar
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+  OTEL_EXPORTER_OTLP_PROTOCOL: http/protobuf
+  OTEL_SDK_DISABLED: ${OTEL_SDK_DISABLED:-false}
+
+services:
+  # ---------- legacy system #1: ERP (Spring Boot + MySQL)
+  erp-db:
+    image: mysql:8.4
+    environment:
+      MYSQL_ROOT_PASSWORD: root
+      MYSQL_DATABASE: erp
+      MYSQL_USER: erp
+      MYSQL_PASSWORD: erp
+    volumes:
+      - ./erp/db:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "mysqladmin", "ping", "-h", "localhost", "-uerp", "-perp"]
+      interval: 3s
+      retries: 40
+
+  erp:
+    build: ./erp
+    ports: ["8081:8080"]
+    environment:
+      <<: *otel-java
+      OTEL_SERVICE_NAME: erp
+    depends_on:
+      erp-db: { condition: service_healthy }
+    restart: unless-stopped
+
+  # ---------- legacy system #2: warehouse app (Spring Boot + PostgreSQL)
+  wms-db:
+    image: postgres:17
+    environment: { POSTGRES_DB: wms, POSTGRES_USER: wms, POSTGRES_PASSWORD: wms }
+    volumes:
+      - ./wms/db:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "wms"]
+      interval: 3s
+      retries: 40
+
+  wms:
+    build: ./wms
+    ports: ["8082:8080"]
+    environment:
+      <<: *otel-java
+      OTEL_SERVICE_NAME: wms
+      # The only change the integration needs. Set via .env / ./switch.sh: http://erp:8080 (direct) or http://glue:8080/erp (glue)
+      ERP_BASE_URL: ${WMS_ERP_URL:-http://erp:8080}
+    depends_on:
+      wms-db: { condition: service_healthy }
+    restart: unless-stopped
+
+  # ---------- the glue service (PHP 8.5): proxy + dashboard, and a worker for retries + reconciliation
+  glue-db:
+    profiles: [glue]
+    image: postgres:17
+    environment: { POSTGRES_DB: glue, POSTGRES_USER: glue, POSTGRES_PASSWORD: glue }
+    volumes:
+      - ./glue/schema.sql:/docker-entrypoint-initdb.d/schema.sql:ro
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "glue"]
+      interval: 3s
+      retries: 40
+
+  glue:
+    profiles: [glue]
+    build: ./glue
+    ports: ["8090:8080"]
+    environment: &glue-env
+      ERP_URL: http://erp:8080
+      WMS_URL: http://wms:8080
+      GLUE_DSN: pgsql:host=glue-db;dbname=glue
+      PHP_CLI_SERVER_WORKERS: 8
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_SERVICE_NAME: glue-proxy
+    depends_on:
+      glue-db: { condition: service_healthy }
+    restart: unless-stopped
+
+  glue-worker:
+    profiles: [glue]
+    build: ./glue
+    command: ["php", "bin/worker.php"]
+    environment:
+      <<: *glue-env
+      OTEL_SERVICE_NAME: glue-worker
+      RECONCILE_EVERY: 30
+      MAX_ATTEMPTS: 6
+    init: true
+    depends_on:
+      glue-db: { condition: service_healthy }
+    restart: unless-stopped
+
+  # ---------- centralised telemetry: everything speaks OTLP to the collector, TELEMETRY picks the destination
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:0.162.0
+    command: ["--config=file:/etc/otelcol/base.yaml", "--config=file:/etc/otelcol/${TELEMETRY:-console}.yaml"]
+    environment:
+      APPLICATIONINSIGHTS_CONNECTION_STRING: ${APPLICATIONINSIGHTS_CONNECTION_STRING:-}
+    volumes:
+      - ./otel:/etc/otelcol:ro
+    restart: unless-stopped
+
+  lgtm:
+    profiles: [lgtm]
+    image: grafana/otel-lgtm:0.36.0
+    ports: ["3300:3000"]
+    restart: unless-stopped

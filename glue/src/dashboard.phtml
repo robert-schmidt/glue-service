@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta http-equiv="refresh" content="5">
+<title>Glue Service</title>
+<style>
+  :root { --bg:#f6f7f9; --card:#fff; --ink:#1d2330; --muted:#6b7385; --line:#e3e6ec; --ok:#1f8a4c; --warn:#b26b00; --bad:#c0362c; --accent:#3557d4; }
+  @media (prefers-color-scheme: dark) { :root { --bg:#12151b; --card:#1a1f27; --ink:#e6e9ef; --muted:#9099aa; --line:#2b313c; --ok:#4cc27e; --warn:#e3a33a; --bad:#ef6a5f; --accent:#7d97ff; } }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--ink); font:14px/1.45 system-ui, sans-serif; }
+  main { max-width:1200px; margin:0 auto; padding:20px 16px 60px; }
+  h1 { font-size:20px; margin:0 0 4px; } h2 { font-size:15px; margin:0 0 10px; }
+  .sub { color:var(--muted); margin-bottom:18px; }
+  .grid { display:grid; gap:16px; grid-template-columns:repeat(auto-fit, minmax(340px, 1fr)); }
+  .card { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:14px 16px; overflow-x:auto; }
+  .stats { display:flex; gap:10px; flex-wrap:wrap; margin-bottom:16px; }
+  .stat { background:var(--card); border:1px solid var(--line); border-radius:10px; padding:10px 14px; min-width:110px; }
+  .stat b { display:block; font-size:22px; font-variant-numeric:tabular-nums; }
+  .stat span { color:var(--muted); font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
+  table { width:100%; border-collapse:collapse; font-size:13px; }
+  th, td { text-align:left; padding:5px 6px; border-bottom:1px solid var(--line); vertical-align:top; }
+  th { color:var(--muted); font-weight:600; font-size:12px; }
+  .diff { background:color-mix(in srgb, var(--warn) 18%, transparent); }
+  .diff small { display:block; color:var(--muted); }
+  .pill { display:inline-block; padding:1px 7px; border-radius:99px; font-size:11px; font-weight:600; border:1px solid currentColor; }
+  .done { color:var(--ok); } .pending, .running { color:var(--accent); } .dead { color:var(--bad); } .superseded, .discarded { color:var(--muted); }
+  .warn { color:var(--warn); } .error { color:var(--bad); } .info { color:var(--muted); }
+  .err { color:var(--bad); font-size:12px; word-break:break-word; }
+  form { display:inline; } button { font:inherit; font-size:12px; padding:3px 9px; border-radius:6px; border:1px solid var(--line); background:var(--bg); color:var(--ink); cursor:pointer; }
+  button:hover { border-color:var(--accent); } .primary { background:var(--accent); color:#fff; border-color:var(--accent); }
+  .row { display:flex; gap:6px; align-items:center; flex-wrap:wrap; margin:4px 0; }
+  .mono { font-family:ui-monospace, monospace; font-size:12px; }
+  .wide { grid-column:1 / -1; }
+</style>
+</head>
+<body>
+<main>
+  <h1>Glue Service · ERP ⇄ WMS</h1>
+  <div class="sub">PHP <?= PHP_VERSION ?> · auto-refresh 5s · <?= date('H:i:s') ?> UTC</div>
+
+  <div class="stats">
+    <?php foreach (['pending', 'running', 'done', 'dead', 'superseded'] as $s): ?>
+      <div class="stat"><b class="<?= $s ?>"><?= (int) ($counts[$s] ?? 0) ?></b><span><?= $s ?> jobs</span></div>
+    <?php endforeach ?>
+    <div class="stat"><b class="<?= $conflicts ? 'warn' : 'done' ?>"><?= count($conflicts) ?></b><span>open conflicts</span></div>
+  </div>
+
+  <div class="grid">
+    <section class="card">
+      <h2>Fault injection</h2>
+      <?php foreach ($chaos as $sys => $c): ?>
+        <div class="row">
+          <b style="width:40px"><?= strtoupper($sys) ?></b>
+          <?php if ($c === null): ?><span class="err">DOWN</span>
+          <?php else: ?><span class="mono"><?= round($c['failRate'] * 100) ?>% fail · <?= (int) $c['latencyMs'] ?>ms</span><?php endif ?>
+        </div>
+        <div class="row">
+          <?php foreach ([[0, 0, 'healthy'], [0.3, 0, '30% 503s'], [1, 0, '100% 503s'], [0, 3000, '+3s latency'], [0, 6000, '+6s (timeout)']] as [$rate, $lat, $label]): ?>
+            <form method="post" action="/chaos"><input type="hidden" name="target" value="<?= $sys ?>"><input type="hidden" name="failRate" value="<?= $rate ?>"><input type="hidden" name="latencyMs" value="<?= $lat ?>"><button><?= $label ?></button></form>
+          <?php endforeach ?>
+        </div>
+      <?php endforeach ?>
+      <div class="row" style="margin-top:10px"><form method="post" action="/reconcile"><button class="primary">Reconcile now</button></form></div>
+    </section>
+
+    <section class="card">
+      <h2>Conflicts awaiting a decision</h2>
+      <?php if (!$conflicts): ?><div class="info">None. Owner rules and the three-way merge handled everything.</div><?php endif ?>
+      <?php foreach ($conflicts as $c): ?>
+        <div style="margin-bottom:10px">
+          <b><?= h("{$c['entity']} {$c['code']}") ?></b> · <span class="mono"><?= h($c['field']) ?></span>
+          <div class="info">was: <?= h($c['base_value']) ?></div>
+          <div class="row">
+            <form method="post" action="/conflicts/<?= $c['id'] ?>/resolve"><input type="hidden" name="value" value="<?= h($c['erp_value']) ?>"><button>Keep ERP: <?= h($c['erp_value']) ?></button></form>
+            <form method="post" action="/conflicts/<?= $c['id'] ?>/resolve"><input type="hidden" name="value" value="<?= h($c['wms_value']) ?>"><button>Keep WMS: <?= h($c['wms_value']) ?></button></form>
+          </div>
+        </div>
+      <?php endforeach ?>
+    </section>
+
+    <section class="card">
+      <h2>Dead letters</h2>
+      <?php if (!$dead): ?><div class="info">Empty.</div><?php endif ?>
+      <?php foreach ($dead as $j): ?>
+        <div style="margin-bottom:10px">
+          <b class="mono"><?= h("#{$j['id']} {$j['dedupe_key']}") ?></b> <span class="info">after <?= (int) $j['attempts'] ?> attempt(s)</span>
+          <div class="err"><?= h($j['last_error']) ?></div>
+          <div class="row">
+            <form method="post" action="/jobs/<?= $j['id'] ?>/retry"><button>Retry</button></form>
+            <form method="post" action="/jobs/<?= $j['id'] ?>/discard"><button>Discard</button></form>
+          </div>
+        </div>
+      <?php endforeach ?>
+    </section>
+
+    <?php foreach ($compare as $entity => $sides): ?>
+      <section class="card wide">
+        <h2>Live data: <?= $entity ?>s (highlight = ERP and WMS disagree)</h2>
+        <?php if (is_string($sides)): ?><div class="err">Could not read: <?= h($sides) ?></div>
+        <?php else: [$erp, $wms] = $sides; $fields = array_keys(MAP[$entity]['owner']); ?>
+          <table>
+            <tr><th>code</th><?php foreach ($fields as $f): ?><th><?= $f ?> <span class="info">(<?= MAP[$entity]['owner'][$f] ?>)</span></th><?php endforeach ?></tr>
+            <?php foreach ($erp as $code => $e): $w = $wms[$code] ?? []; ?>
+              <tr>
+                <td class="mono"><?= h($code) ?></td>
+                <?php foreach ($fields as $f): ?>
+                  <?php if (($w[$f] ?? null) === $e[$f]): ?><td><?= h($e[$f]) ?></td>
+                  <?php else: ?><td class="diff"><small>ERP</small><?= h($e[$f]) ?><small>WMS</small><?= h($w[$f] ?? '(missing)') ?></td><?php endif ?>
+                <?php endforeach ?>
+              </tr>
+            <?php endforeach ?>
+          </table>
+        <?php endif ?>
+      </section>
+    <?php endforeach ?>
+
+    <section class="card">
+      <h2>Recent jobs</h2>
+      <table>
+        <tr><th>#</th><th>key</th><th>status</th><th>try</th></tr>
+        <?php foreach ($jobs as $j): ?>
+          <tr title="<?= h($j['last_error']) ?>">
+            <td class="mono"><?= $j['id'] ?></td><td class="mono"><?= h($j['dedupe_key']) ?></td>
+            <td><span class="pill <?= $j['status'] ?>"><?= $j['status'] ?></span></td><td><?= (int) $j['attempts'] ?></td>
+          </tr>
+        <?php endforeach ?>
+      </table>
+    </section>
+
+    <section class="card">
+      <h2>Audit log</h2>
+      <table>
+        <?php foreach ($log as $l): ?>
+          <tr><td class="mono info" style="white-space:nowrap"><?= substr($l['at'], 11, 8) ?></td><td class="<?= $l['level'] ?>"><?= h($l['message']) ?></td></tr>
+        <?php endforeach ?>
+      </table>
+    </section>
+  </div>
+</main>
+</body>
+</html>
