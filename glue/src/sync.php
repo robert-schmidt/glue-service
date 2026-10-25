@@ -118,6 +118,111 @@ function http(string $method, string $url, ?array $body = null, array $accept = 
     return [$code, $data];
 }
 
+// ---------------------------------------------------------------- plugins
+
+/**
+ * Every write the glue makes to either system goes through here. Plugin hooks for "<system>.write":
+ *  - transforms run before the write, in file-name order, and may change or reject the payload;
+ *  - observers run after it succeeded, get the final payload and can neither change it nor fail it.
+ * ctx.id comes from the payload as the glue built it, so every repeat of a write (retry, replay) has the same id.
+ */
+function send(string $sys, string $method, string $path, array $body, array $accept = []): array
+{
+    $event = "$sys.write";
+    $ctx = ['event' => $event, 'system' => $sys, 'method' => $method, 'path' => $path];
+    $ctx['id'] = substr(hash('sha256', json_encode([$ctx, $body])), 0, 16);
+    $body = transform($event, $body, $ctx);
+    $result = http($method, ($sys === 'erp' ? ERP : WMS) . $path, $body, $accept);
+    notify($event, $body, [...$ctx, 'status' => $result[0]]);
+    return $result;
+}
+
+/**
+ * Plugins are the *.php files in PLUGINS_DIR (*.php.off = disabled), each returning
+ * ['transform' => [event => fn], 'observe' => [event => fn]]. Re-read whenever a file is added, renamed or edited.
+ * @return array{transform: array<string, list<array{string, callable}>>, observe: array<string, list<array{string, callable}>>}
+ */
+function plugins(): array
+{
+    static $key = null, $hooks = [];
+    clearstatcache();
+    $files = glob((getenv('PLUGINS_DIR') ?: __DIR__ . '/../plugins') . '/*.php') ?: [];
+    $now = implode('|', array_map(fn(string $f) => $f . '@' . filemtime($f), $files));
+    if ($now === $key) {
+        return $hooks;
+    }
+    [$key, $hooks, $loaded] = [$now, ['transform' => [], 'observe' => []], []];
+    foreach ($files as $file) {
+        $name = basename($file, '.php');
+        try {
+            $plugin = require $file;
+            if (!is_array($plugin) || array_diff_key($plugin, $hooks)) {
+                throw new UnexpectedValueException("must return ['transform' => [event => fn], 'observe' => [event => fn]]");
+            }
+            foreach ($plugin as $kind => $byEvent) {
+                foreach ($byEvent as $event => $fn) {
+                    $hooks[$kind][$event][] = [$name, $fn];
+                }
+            }
+            $loaded[] = $name;
+        } catch (Throwable $e) {
+            say("[plugin] $name not loaded: {$e->getMessage()}", 'error'); // a broken plugin never stops the glue
+        }
+    }
+    say('[plugin] active: ' . (implode(', ', $loaded) ?: 'none'));
+    return $hooks;
+}
+
+/**
+ * Transforms return the payload (changed or not), or null to leave it. Throwing Permanent rejects the write;
+ * any other error is logged and the payload passes on unchanged. They run again on every retry: same input, same output.
+ * Logged before any transform runs and once more if one changed it (PAYLOAD_LOG: always | changed | off).
+ */
+function transform(string $event, array $payload, array $ctx): array
+{
+    $mode = getenv('PAYLOAD_LOG') ?: 'always';
+    $line = fn(array $p) => "$event {$ctx['method']} {$ctx['path']} id={$ctx['id']} " . json_encode($p, JSON_UNESCAPED_SLASHES | JSON_UNESCAPED_UNICODE);
+    if ($mode === 'always') {
+        say('[payload] ' . $line($payload));
+    }
+    $out = $payload;
+    $by = [];
+    foreach (plugins()['transform'][$event] ?? [] as [$name, $fn]) {
+        try {
+            $r = $fn($out, $ctx);
+        } catch (Permanent $e) {
+            say("[plugin] $name rejected {$ctx['method']} {$ctx['path']} id={$ctx['id']}: {$e->getMessage()}", 'warn');
+            throw $e;
+        } catch (Throwable $e) {
+            say("[plugin] $name failed, payload passed on unchanged: {$e->getMessage()}", 'error');
+            continue;
+        }
+        if (is_array($r) && $r !== $out) {
+            [$out, $by[]] = [$r, $name];
+        }
+    }
+    if ($by && $mode !== 'off') {
+        if ($mode === 'changed') {
+            say('[payload] ' . $line($payload));
+        }
+        $fields = array_filter(array_unique([...array_keys($payload), ...array_keys($out)]), fn($k) => ($payload[$k] ?? null) !== ($out[$k] ?? null));
+        say('[payload altered by ' . implode(', ', $by) . '] changed ' . implode(', ', $fields) . ': ' . $line($out));
+    }
+    return $out;
+}
+
+/** Observers get a copy of what was written. Errors are logged and never fail the write, which already happened. */
+function notify(string $event, array $payload, array $ctx): void
+{
+    foreach (plugins()['observe'][$event] ?? [] as [$name, $fn]) {
+        try {
+            $fn($payload, $ctx);
+        } catch (Throwable $e) {
+            say("[plugin] $name observer failed: {$e->getMessage()}", 'error');
+        }
+    }
+}
+
 // ---------------------------------------------------------------- job queue
 
 /** Returns false when skipped because the same key is already dead-lettered (a human has to look first). */
@@ -189,8 +294,8 @@ function recoverStale(): void
 function handle(string $type, array $p): void
 {
     match ($type) {
-        'erp.ship' => http('POST', ERP . '/api/orders/' . rawurlencode($p['orderNo']) . '/ship', ['TRACKING_NO' => $p['trackingNo']], accept: [409]),
-        'erp.stock' => http('PUT', ERP . '/api/products/' . rawurlencode($p['sku']) . '/stock', ['QTY' => $p['qty']]),
+        'erp.ship' => send('erp', 'POST', '/api/orders/' . rawurlencode($p['orderNo']) . '/ship', ['TRACKING_NO' => $p['trackingNo']], accept: [409]),
+        'erp.stock' => send('erp', 'PUT', '/api/products/' . rawurlencode($p['sku']) . '/stock', ['QTY' => $p['qty']]),
         'customer.sync' => syncOne('customer', $p),
         'product.sync' => syncOne('product', $p),
         'conflict.resolve' => resolveConflict($p['id'], $p['value']),
@@ -291,16 +396,16 @@ function erpWrite(string $entity, string $code, array $current, array $patch): v
 {
     if ($entity === 'customer') {
         // the ERP only takes full records: current ERP state + our patch, so nothing else gets clobbered
-        http('PUT', ERP . '/api/customers/' . rawurlencode($code), native('customer', 'erp', [...$current, ...$patch]));
+        send('erp', 'PUT', '/api/customers/' . rawurlencode($code), native('customer', 'erp', [...$current, ...$patch]));
     } elseif (isset($patch['stock'])) {
         // stock is the only product field outside systems may post to the ERP
-        http('PUT', ERP . '/api/products/' . rawurlencode($code) . '/stock', ['QTY' => (int) $patch['stock']]);
+        send('erp', 'PUT', '/api/products/' . rawurlencode($code) . '/stock', ['QTY' => (int) $patch['stock']]);
     }
 }
 
 function wmsWrite(string $entity, string $code, array $patch): void
 {
-    http('PUT', WMS . MAP[$entity]['wmsPath'] . '/' . rawurlencode($code), native($entity, 'wms', $patch));
+    send('wms', 'PUT', MAP[$entity]['wmsPath'] . '/' . rawurlencode($code), native($entity, 'wms', $patch));
 }
 
 /** Merge one record and push the result to both sides. Idempotent: running it twice changes nothing the second time. */

@@ -79,6 +79,10 @@ services:
       PHP_CLI_SERVER_WORKERS: 8
       OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
       OTEL_SERVICE_NAME: glue-proxy
+      PAYLOAD_LOG: ${PAYLOAD_LOG:-always}
+      OUTBOX_URL: ${OUTBOX_URL:-}
+    volumes: &plugins
+      - ./glue/plugins:/app/plugins:ro # plugins are picked up live: ./switch.sh plugin new|on|off <name>
     depends_on:
       glue-db: { condition: service_healthy }
     restart: unless-stopped
@@ -92,6 +96,7 @@ services:
       OTEL_SERVICE_NAME: glue-worker
       RECONCILE_EVERY: 30
       MAX_ATTEMPTS: 6
+    volumes: *plugins
     init: true
     depends_on:
       glue-db: { condition: service_healthy }

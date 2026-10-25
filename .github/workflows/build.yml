@@ -6,4 +6,4 @@ jobs:
     steps:
       - uses: actions/checkout@v5
       - run: docker compose --profile glue build
-      - run: docker compose run --rm --no-deps glue php -d zend.assertions=1 tests/merge_test.php
+      - run: docker compose run --rm --no-deps glue sh -c 'for t in tests/*_test.php; do php -d zend.assertions=1 $t || exit 1; done'

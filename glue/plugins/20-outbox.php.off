@@ -1,0 +1,10 @@
+<?php
+// Example observer: copies every successful write to another system (data lake, event bus, audit service).
+// A replayed write arrives with the same ctx id: the receiver de-duplicates on it.
+// Enable: set OUTBOX_URL in .env, then ./switch.sh plugin on 20-outbox
+$copy = function (array $payload, array $ctx): void {
+    if ($url = getenv('OUTBOX_URL')) {
+        http('POST', $url, [...$ctx, 'payload' => $payload], timeout: 2);
+    }
+};
+return ['observe' => ['erp.write' => $copy, 'wms.write' => $copy]];

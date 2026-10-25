@@ -188,6 +188,54 @@ sequenceDiagram
 - **Fault injection:** a panel per system.
 - **Logs:** `docker compose logs -f glue-worker` shows every attempt, retry and dead letter; `audit` holds the change history.
 
+## Plugins
+
+Plugins hook into every write the glue sends to the ERP or the WMS, whatever caused it: a WMS message, a retry, the reconcile sweep or a resolved conflict. A plugin is one PHP file in `glue/plugins/`. The folder is mounted into the containers, and a change takes effect on the next write, with no restart or rebuild.
+
+```bash
+./switch.sh plugins                    # list, in the order they run (file name order)
+./switch.sh plugin new 30-my-check     # create glue/plugins/30-my-check.php from a starter
+./switch.sh plugin off 30-my-check     # disable (renamed to .php.off; delete the file to remove it)
+./switch.sh plugin on 30-my-check      # enable again
+```
+
+A plugin registers two kinds of hooks per event (`erp.write`, `wms.write`):
+
+| | `transform` | `observe` |
+|---|---|---|
+| Runs | Before the write, on every attempt | After the write succeeded, once |
+| Gets | The payload in the target system's field names | A copy of the final payload, plus the response `status` |
+| May | Return a changed payload, `null` to leave it, or throw `Permanent` to reject the write | Only look: copy it to a data lake, event bus or audit service |
+| On error | Logged; the payload passes on unchanged | Logged; never fails or retries the write |
+
+```php
+<?php
+return [
+    'transform' => [
+        'erp.write' => fn(array $payload, array $ctx): ?array =>
+            isset($payload['CITY']) ? [...$payload, 'CITY' => mb_strtoupper($payload['CITY'])] : null,
+    ],
+    'observe' => [
+        'wms.write' => function (array $payload, array $ctx): void { /* $ctx: event, system, method, path, id, status */ },
+    ],
+];
+```
+
+- **Ids:** `ctx.id` is derived from the payload as the glue built it. Every repeat of the same write (retries, replays) carries the same id, so receivers can drop duplicates on it.
+- **Transforms must be deterministic:** the same input gives the same output, because they run again on every retry. A changed value is what the target system stores, and the next sweep treats it as an edit on that side and syncs it by the ownership rules. Uppercasing an ERP city, for example, reaches the WMS on the next sweep. Changing a field the other system owns (e.g. stock in an ERP write) would be rewritten on every sweep.
+- **Keep hooks fast:** they run inside the write, and for WMS messages inside its `INLINE_BUDGET`.
+- **Examples:** `10-erp-city-uppercase` (transform) and `20-outbox` (observer: posts each write to `OUTBOX_URL`) ship disabled.
+
+**Payload log.** Every write is logged before any transform runs, and once more if a transform changed it, with the changed fields and the transform's name. Both lines carry the same id.
+
+```bash
+./switch.sh payload-log always    # default: before every write, and again when changed
+./switch.sh payload-log changed   # only writes a transform changed (before + after)
+./switch.sh payload-log off
+```
+
+Payloads contain customer data (names, e-mail addresses, addresses) and go to the central log like every other line. Use `changed` or `off` where that is not wanted.
+
 ## Centralised telemetry
 
 All services send traces and logs (the Java agents also send JVM and HTTP metrics) over OpenTelemetry (OTLP) to `otel-collector`. The destination is one switch:
@@ -234,11 +282,14 @@ The glue is stateless apart from its PostgreSQL database, and runs anywhere PHP 
 | `INLINE_BUDGET` | `3` | Seconds an inline write may take before it is queued; keep it below the WMS's own ERP timeout (5 s) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://otel-collector:4318` | Empty disables glue telemetry |
 | `OTEL_SERVICE_NAME` | `glue-proxy` / `glue-worker` | Name in the telemetry backend |
+| `PAYLOAD_LOG` | `always` | `always`, `changed` or `off`, see [Plugins](#plugins) |
+| `PLUGINS_DIR` | `/app/plugins` | Plugin folder |
+| `OUTBOX_URL` | empty | Target of the `20-outbox` example plugin |
 
 ## Tests
 
 ```bash
-docker compose run --rm --no-deps glue php -d zend.assertions=1 tests/merge_test.php
+docker compose run --rm --no-deps glue sh -c 'for t in tests/*_test.php; do php -d zend.assertions=1 $t || exit 1; done'
 ```
 
 ## Limits and next steps
@@ -257,6 +308,6 @@ compose.yaml  .env  switch.sh  .github/workflows/build.yml
 erp/    Spring Boot app, Dockerfile, db/ seed
 wms/    Spring Boot app, Dockerfile, db/ seed
 glue/   public/index.php (proxy + dashboard) · bin/worker.php · src/sync.php (mapping, merge, queue, reconcile)
-        src/otel.php · src/dashboard.phtml · schema.sql · tests/
+        src/otel.php · src/dashboard.phtml · schema.sql · tests/ · plugins/ (mounted, live)
 otel/   collector config: base.yaml + one file per destination
 ```

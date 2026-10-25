@@ -1,0 +1,9 @@
+<?php
+// Example transform: the ERP wants city names in capitals.
+// Enable: ./switch.sh plugin on 10-erp-city-uppercase
+return [
+    'transform' => [
+        'erp.write' => fn(array $payload, array $ctx): ?array =>
+            isset($payload['CITY']) ? [...$payload, 'CITY' => mb_strtoupper($payload['CITY'])] : null,
+    ],
+];
