@@ -147,6 +147,7 @@ Because the ERP only accepts full-record writes, the glue always sends *current 
 | Business errors | ERP `4xx` (cancelled order, validation) is returned to the WMS immediately with the real reason, and is never retried. |
 | Retries | Exponential backoff with jitter (2 s, 4 s, 8 s … max 60 s), `MAX_ATTEMPTS` (default 6), then the dead-letter queue. |
 | Ordering | Jobs for the same record run strictly in order. A newer write to a queued record replaces the queued value instead of piling up behind it. |
+| Duplicates and replays | WMS messages carry current values, not deltas. A stock or customer message is applied only while it still matches the WMS's own record. An older one (a republished queue, a re-run batch) gets `200` so the sender stops, is not applied, and the record is re-synced from both systems. Shipments are keyed by order number: a repeat gets the ERP's `409` and counts as done. Business keys (order number, SKU, customer number) pass through unchanged. |
 | Partial failures | A failing record during a sweep becomes its own job; the rest of the batch proceeds. Each handler is idempotent. |
 | Worker crash | The container restarts. Jobs left `running` for more than 2 minutes are handed back. |
 | Changes behind the APIs' back | The reconciliation sweep compares full data sets, so direct database edits and missed pulls are caught too. |
@@ -246,6 +247,7 @@ docker compose run --rm --no-deps glue php -d zend.assertions=1 tests/merge_test
 - The built-in PHP web server is enough for one site at moderate volume. For higher load, use FrankenPHP or nginx + php-fpm (same code).
 - There is one worker process. Jobs are safe to scale out (`SKIP LOCKED` plus per-record ordering); concurrent sweeps would need an advisory lock first.
 - Each sweep scans all records. Past roughly 10k rows per entity, switch to `ROW_VER` cursors.
+- Writes that reach the ERP without passing through the glue (an old batch job, a second integration) cannot be checked, and look like ERP edits. Allow the ERP's write endpoints only from the glue (gateway or firewall rule).
 - New records created by the WMS itself are not mapped. Every record currently starts in the ERP.
 
 ## Layout

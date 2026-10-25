@@ -267,6 +267,12 @@ function merge(array $base, array $erp, array $wms, array $owners): array
     return $r;
 }
 
+/** The WMS sends current values, never deltas: a message that no longer matches its own record is a replay or arrived late. */
+function isCurrent(array $msg, array $current): bool
+{
+    return array_diff_assoc(array_filter($msg, fn($v) => $v !== null), $current) === [];
+}
+
 // ---------------------------------------------------------------- sync
 
 function snapshot(string $entity, string $code): ?array

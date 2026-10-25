@@ -50,13 +50,19 @@ function proxy(string $method, string $path): void
 
     if ($method === 'PUT' && preg_match('#^/api/customers/([^/]+)$#', $path, $m)) {
         $code = rawurldecode($m[1]);
+        $wms = canon('customer', 'erp', ['CUST_NO' => $code, ...$in]);
         // the WMS sends a full record; the merge works out which fields it actually changed
-        writeThrough('customer.sync', $code, ['code' => $code, 'wms' => canon('customer', 'erp', ['CUST_NO' => $code, ...$in])]);
+        if (!stale('customer', $code, $wms)) {
+            writeThrough('customer.sync', $code, ['code' => $code, 'wms' => $wms]);
+        }
     } elseif ($method === 'PUT' && preg_match('#^/api/products/([^/]+)/stock$#', $path, $m)) {
+        $sku = rawurldecode($m[1]);
         $qty = filter_var($in['QTY'] ?? null, FILTER_VALIDATE_INT, ['options' => ['min_range' => 0]]);
-        $qty === false
-            ? json(['error' => 'QTY must be an integer >= 0'], 400)
-            : writeThrough('erp.stock', rawurldecode($m[1]), ['sku' => rawurldecode($m[1]), 'qty' => $qty]);
+        if ($qty === false) {
+            json(['error' => 'QTY must be an integer >= 0'], 400);
+        } elseif (!stale('product', $sku, ['stock' => norm($qty)])) {
+            writeThrough('erp.stock', $sku, ['sku' => $sku, 'qty' => $qty]);
+        }
     } elseif ($method === 'POST' && preg_match('#^/api/orders/([^/]+)/ship$#', $path, $m)) {
         $tracking = trim((string) ($in['TRACKING_NO'] ?? ''));
         $tracking === ''
@@ -65,6 +71,25 @@ function proxy(string $method, string $path): void
     } else {
         forward($method, $path . (isset($_SERVER['QUERY_STRING']) ? "?{$_SERVER['QUERY_STRING']}" : ''), $in);
     }
+}
+
+/**
+ * Replayed or out-of-order message (a republished queue, a re-run batch): acknowledged so the sender stops, not applied,
+ * and the record is synced from both systems' current state instead. Shipments need no check: the order number is the key.
+ */
+function stale(string $entity, string $code, array $msg): bool
+{
+    try {
+        if (isCurrent($msg, fetch($entity, 'wms', $code))) {
+            return false;
+        }
+    } catch (Throwable) {
+        return false; // can't tell without the WMS record: apply as before
+    }
+    enqueue("$entity.sync", $code, ['code' => $code]);
+    audit("$entity $code: ignored a message that no longer matches the WMS record (replay or out of order)", 'warn');
+    json(['ok' => true, 'ignored' => 'stale'], 200);
+    return true;
 }
 
 function writeThrough(string $type, string $code, array $payload): void

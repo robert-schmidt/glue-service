@@ -38,4 +38,10 @@ assert($p['erp'] === ['stock' => '112'] && $p['wms'] === []);
 // mapping round-trip
 assert(native('customer', 'wms', ['address' => 'Dock 3']) === ['shipAddress' => 'Dock 3']);
 
+// replay check: only what the message carries is compared; an older value means stale
+$wmsNow = canon('product', 'wms', ['sku' => 'S', 'description' => 'Bolt', 'unitPrice' => 12.5, 'onHand' => 107]);
+assert(isCurrent(['stock' => norm(107)], $wmsNow));
+assert(!isCurrent(['stock' => norm(112)], $wmsNow));
+assert(isCurrent(['code' => 'S', 'name' => null], $wmsNow)); // null = field not sent
+
 echo "merge tests passed\n";
