@@ -3,7 +3,7 @@
 A small integration service in **PHP 8.5** that keeps a legacy ERP and a legacy warehouse management system (WMS) in sync in both directions. It handles field-level conflicts, retries, partial failures and drift, and neither system's code changes.
 
 ```mermaid
-flowchart LR
+flowchart TB
   subgraph W["WMS (legacy)"]
     WMS["wms<br/>Spring Boot · :8082"]
     WDB[("wms-db<br/>PostgreSQL 17")]
@@ -11,20 +11,26 @@ flowchart LR
   subgraph G["Glue (PHP 8.5)"]
     PROXY["glue · :8090<br/>/erp/* proxy + dashboard"]
     WORKER["glue-worker<br/>retries · reconciler"]
+    PLUG["plugins<br/>payload log → transforms → write → observers"]
     GDB[("glue-db · PostgreSQL 17<br/>jobs · snapshots · conflicts · audit")]
   end
   subgraph E["ERP (legacy, system of record)"]
     ERP["erp<br/>Spring Boot · :8081"]
     EDB[("erp-db<br/>MySQL 8.4")]
   end
+  OUT["outbox / data lake<br/>(optional)"]
   WMS --- WDB
   ERP --- EDB
   WMS -- "ERP_BASE_URL<br/>pull every 10 s, write-backs" --> PROXY
-  PROXY -- "reads, inline writes" --> ERP
+  PROXY -- "reads" --> ERP
+  PROXY -. "replay check:<br/>still the current record?" .-> WMS
   PROXY -- "ERP down: queue, reply 202" --> GDB
   WORKER -- "claim jobs, save snapshots" --> GDB
-  WORKER -- "retries, merged writes" --> ERP
-  WORKER -- "merged writes" --> WMS
+  PROXY -- "inline writes" --> PLUG
+  WORKER -- "retries, merged writes" --> PLUG
+  PLUG -- "writes" --> ERP
+  PLUG -- "writes" --> WMS
+  PLUG -. "observer copies" .-> OUT
   WMS -. "direct mode<br/>./switch.sh direct" .-> ERP
 ```
 
@@ -163,9 +169,11 @@ sequenceDiagram
   participant K as glue-worker
   participant E as ERP
   W->>G: POST /erp/api/orders/{no}/ship
+  Note over G: payload log, transforms (plugins)
   G->>E: POST /api/orders/{no}/ship
   alt ERP answers 2xx (or 409: already shipped)
     E-->>G: 200
+    Note over G: observers (plugins)
     G-->>W: 200
   else ERP answers 4xx (e.g. order cancelled)
     E-->>G: 422
