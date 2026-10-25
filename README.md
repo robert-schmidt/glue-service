@@ -143,7 +143,7 @@ Because the ERP only accepts full-record writes, the glue always sends *current 
 
 | Concern | Handling |
 |---|---|
-| ERP slow or down | Writes from the WMS are tried inline first. On a 5xx, timeout or connection error they are queued, and the WMS gets `202`, so it never fails or needs a manual retry. |
+| ERP slow or down | Writes from the WMS are tried inline first. On a 5xx, connection error or after `INLINE_BUDGET` seconds (well inside the WMS's own 5 s timeout) they are queued, and the WMS gets `202`, so it never fails or needs a manual retry. |
 | Business errors | ERP `4xx` (cancelled order, validation) is returned to the WMS immediately with the real reason, and is never retried. |
 | Retries | Exponential backoff with jitter (2 s, 4 s, 8 s … max 60 s), `MAX_ATTEMPTS` (default 6), then the dead-letter queue. |
 | Ordering | Jobs for the same record run strictly in order. A newer write to a queued record replaces the queued value instead of piling up behind it. |
@@ -230,6 +230,7 @@ The glue is stateless apart from its PostgreSQL database, and runs anywhere PHP 
 | `GLUE_DSN` | `pgsql:host=glue-db;dbname=glue` | Glue database |
 | `RECONCILE_EVERY` | `30` | Seconds between sweeps |
 | `MAX_ATTEMPTS` | `6` | Attempts before a job is dead-lettered |
+| `INLINE_BUDGET` | `3` | Seconds an inline write may take before it is queued; keep it below the WMS's own ERP timeout (5 s) |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | `http://otel-collector:4318` | Empty disables glue telemetry |
 | `OTEL_SERVICE_NAME` | `glue-proxy` / `glue-worker` | Name in the telemetry backend |
 

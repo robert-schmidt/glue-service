@@ -40,6 +40,7 @@ try {
  */
 function proxy(string $method, string $path): void
 {
+    budget(INLINE_BUDGET);
     $raw = file_get_contents('php://input');
     $in = $raw === '' ? [] : json_decode($raw, true);
     if (!is_array($in)) {

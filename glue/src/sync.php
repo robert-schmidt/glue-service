@@ -11,6 +11,7 @@ final class Permanent extends RuntimeException {}
 define('ERP', getenv('ERP_URL') ?: 'http://erp:8080');
 define('WMS', getenv('WMS_URL') ?: 'http://wms:8080');
 define('MAX_ATTEMPTS', (int) (getenv('MAX_ATTEMPTS') ?: 6));
+define('INLINE_BUDGET', (float) (getenv('INLINE_BUDGET') ?: 3));
 
 /**
  * Canonical field => each system's field name, plus who owns each field.
@@ -65,19 +66,36 @@ function say(string $line, string $level = 'info'): void
 }
 
 /**
+ * Seconds left for the current request. The proxy sets it: the WMS stops waiting after 5 s, so an inline attempt has to
+ * give up early enough for the 202 to reach it, or the WMS rolls back a write the glue then delivers anyway.
+ */
+function budget(?float $seconds = null): float
+{
+    static $until = INF;
+    if ($seconds !== null) {
+        $until = microtime(true) + $seconds;
+    }
+    return $until - microtime(true);
+}
+
+/**
  * JSON over HTTP with failure classification. Status codes in $accept are returned instead of thrown.
  * @return array{int, mixed}
  */
 function http(string $method, string $url, ?array $body = null, array $accept = [], int $timeout = 5): array
 {
+    $ms = (int) (min($timeout, budget()) * 1000);
+    if ($ms <= 0) {
+        throw new Transient("$method $url: inline time budget used up");
+    }
     $host = parse_url($url, PHP_URL_HOST);
     Otel::start("$method $host", Otel::CLIENT, ['http.request.method' => $method, 'url.full' => $url, 'server.address' => $host]);
     $ch = curl_init($url);
     curl_setopt_array($ch, [
         CURLOPT_CUSTOMREQUEST => $method,
         CURLOPT_RETURNTRANSFER => true,
-        CURLOPT_CONNECTTIMEOUT => 2,
-        CURLOPT_TIMEOUT => $timeout,
+        CURLOPT_CONNECTTIMEOUT_MS => min(2000, $ms),
+        CURLOPT_TIMEOUT_MS => $ms,
         CURLOPT_HTTPHEADER => ['Content-Type: application/json', 'Accept: application/json', 'traceparent: ' . Otel::traceparent()],
     ]);
     if ($body !== null) {
@@ -314,7 +332,10 @@ function reconcile(): void
             $code = (string) $code;
             if (!isset($wms[$code])) continue; // the WMS creates new records itself on its next ERP pull
             try {
-                syncRecord($entity, $code, $erp, $wms[$code]);
+                // the bulk read can be seconds old: a record with something to write is re-read first,
+                // or a stale full record would overwrite an ERP edit made meanwhile (lost update)
+                $m = merge(snapshot($entity, $code) ?? $erp, $erp, $wms[$code], MAP[$entity]['owner']);
+                $m['erp'] || $m['wms'] ? syncOne($entity, ['code' => $code]) : syncRecord($entity, $code, $erp, $wms[$code]);
             } catch (Throwable $e) {
                 if (enqueue("$entity.sync", $code, ['code' => $code], skipIfDead: true)) {
                     audit("$entity $code failed during reconcile, queued on its own: {$e->getMessage()}", 'warn');
