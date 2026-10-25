@@ -294,23 +294,6 @@ The glue is stateless apart from its PostgreSQL database, and runs anywhere PHP 
 | `PLUGINS_DIR` | `/app/plugins` | Plugin folder |
 | `OUTBOX_URL` | empty | Target of the `20-outbox` example plugin |
 
-## Running the ERP or WMS jar without Docker
-
-Every `v*` tag publishes `erp.jar` and `wms.jar` on the repository's Releases page (every CI run also keeps them as a build artifact). You need Java 21 and the apps' databases, which compose provides:
-
-```bash
-docker compose up -d erp-db wms-db
-docker compose stop erp wms            # or keep them and use other ports below
-
-SPRING_DATASOURCE_URL='jdbc:mysql://localhost:13306/erp?useSSL=false&allowPublicKeyRetrieval=true' \
-  SERVER_PORT=8081 java -jar erp.jar
-
-SPRING_DATASOURCE_URL=jdbc:postgresql://localhost:15432/wms ERP_BASE_URL=http://localhost:8081 \
-  SERVER_PORT=8082 java -jar wms.jar
-```
-
-To build them yourself: `mvn -f erp/pom.xml package` and `mvn -f wms/pom.xml package` (output: `target/app.jar`).
-
 ## Tests
 
 ```bash

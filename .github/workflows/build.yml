@@ -8,20 +8,11 @@ jobs:
       - run: docker compose --profile glue build
       - run: docker compose run --rm --no-deps glue sh -c 'for t in tests/*_test.php; do php -d zend.assertions=1 $t || exit 1; done'
 
-  # ERP contract tests (real MySQL via Testcontainers) and the two jars; a v* tag publishes them as a release
+  # ERP contract tests against a real MySQL (Testcontainers)
   java:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v5
       - uses: actions/setup-java@v5
         with: { distribution: temurin, java-version: '21', cache: maven }
       - run: mvn -B -q -f erp/pom.xml verify
-      - run: mvn -B -q -f wms/pom.xml package
-      - run: cp erp/target/app.jar erp.jar && cp wms/target/app.jar wms.jar
-      - uses: actions/upload-artifact@v4
-        with: { name: jars, path: '*.jar' }
-      - if: startsWith(github.ref, 'refs/tags/v')
-        run: gh release create "$GITHUB_REF_NAME" erp.jar wms.jar --title "$GITHUB_REF_NAME" --generate-notes
-        env: { GH_TOKEN: '${{ github.token }}' }
