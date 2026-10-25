@@ -39,9 +39,9 @@ flowchart TB
 | Service | Stack | Host port | Role |
 |---|---|---|---|
 | `erp` | Java 21, Spring Boot | 8081 | System of record for customers, products, prices and sales orders |
-| `erp-db` | MySQL 8.4 | none | ERP database |
+| `erp-db` | MySQL 8.4 | 13306 | ERP database |
 | `wms` | Java 21, Spring Boot | 8082 | Warehouse app: stock, bins, shipments; local copy of ERP master data |
-| `wms-db` | PostgreSQL 17 | none | WMS database |
+| `wms-db` | PostgreSQL 17 | 15432 | WMS database |
 | `glue` | PHP 8.5 | 8090 | ERP-compatible proxy for the WMS + operations dashboard |
 | `glue-worker` | PHP 8.5 | none | Job processor (retries, dead letters) + periodic reconciler |
 | `glue-db` | PostgreSQL 17 | none | Job queue, sync snapshots, conflicts, audit log |
@@ -294,10 +294,32 @@ The glue is stateless apart from its PostgreSQL database, and runs anywhere PHP 
 | `PLUGINS_DIR` | `/app/plugins` | Plugin folder |
 | `OUTBOX_URL` | empty | Target of the `20-outbox` example plugin |
 
+## Running the ERP or WMS jar without Docker
+
+Every `v*` tag publishes `erp.jar` and `wms.jar` on the repository's Releases page (every CI run also keeps them as a build artifact). You need Java 21 and the apps' databases, which compose provides:
+
+```bash
+docker compose up -d erp-db wms-db
+docker compose stop erp wms            # or keep them and use other ports below
+
+SPRING_DATASOURCE_URL='jdbc:mysql://localhost:13306/erp?useSSL=false&allowPublicKeyRetrieval=true' \
+  SERVER_PORT=8081 java -jar erp.jar
+
+SPRING_DATASOURCE_URL=jdbc:postgresql://localhost:15432/wms ERP_BASE_URL=http://localhost:8081 \
+  SERVER_PORT=8082 java -jar wms.jar
+```
+
+To build them yourself: `mvn -f erp/pom.xml package` and `mvn -f wms/pom.xml package` (output: `target/app.jar`).
+
 ## Tests
 
 ```bash
+# glue: merge, replay check, plugins
 docker compose run --rm --no-deps glue sh -c 'for t in tests/*_test.php; do php -d zend.assertions=1 $t || exit 1; done'
+
+# ERP contract: the answers the glue relies on (full-record PUT, absolute stock, 409 on a repeated ship, 422 business errors),
+# against a throwaway MySQL with the real schema and seed. Needs Java 21 and Docker.
+mvn -f erp/pom.xml test
 ```
 
 ## Limits and next steps
@@ -313,7 +335,7 @@ docker compose run --rm --no-deps glue sh -c 'for t in tests/*_test.php; do php 
 
 ```
 compose.yaml  .env  switch.sh  .github/workflows/build.yml
-erp/    Spring Boot app, Dockerfile, db/ seed
+erp/    Spring Boot app, Dockerfile, db/ seed, src/test (contract tests)
 wms/    Spring Boot app, Dockerfile, db/ seed
 glue/   public/index.php (proxy + dashboard) · bin/worker.php · src/sync.php (mapping, merge, queue, reconcile)
         src/otel.php · src/dashboard.phtml · schema.sql · tests/ · plugins/ (mounted, live)

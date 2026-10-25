@@ -16,6 +16,7 @@ services:
       MYSQL_DATABASE: erp
       MYSQL_USER: erp
       MYSQL_PASSWORD: erp
+    ports: ["13306:3306"] # for running erp.jar outside Docker
     volumes:
       - ./erp/db:/docker-entrypoint-initdb.d:ro
     healthcheck:
@@ -37,6 +38,7 @@ services:
   wms-db:
     image: postgres:17
     environment: { POSTGRES_DB: wms, POSTGRES_USER: wms, POSTGRES_PASSWORD: wms }
+    ports: ["15432:5432"] # for running wms.jar outside Docker
     volumes:
       - ./wms/db:/docker-entrypoint-initdb.d:ro
     healthcheck:
