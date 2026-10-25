@@ -2,17 +2,30 @@
 
 A small integration service in **PHP 8.5** that keeps a legacy ERP and a legacy warehouse management system (WMS) in sync in both directions. It handles field-level conflicts, retries, partial failures and drift, and neither system's code changes.
 
-```
-                         ┌───────────────────────── glue (PHP 8.5) ─────────────────────────┐
- ┌───────────┐  REST     │  proxy (/erp/*)  ──► write-through ──► ERP                       │  REST   ┌───────────┐
- │    WMS    │──────────►│        │ ERP down?                                               │◄───────►│    ERP    │
- │ Spring    │  (was:    │        ▼                                                         │         │ Spring    │
- │ Boot +    │  direct   │  jobs queue ──► worker: retry · backoff · dead letter            │         │ Boot +    │
- │ Postgres  │  to ERP)  │                 reconciler: 3-way merge sweep every 30s ─────────┼────────►│ MySQL     │
- └───────────┘◄──────────│  snapshots · conflicts · audit   (glue-db, PostgreSQL)           │         └───────────┘
-       ▲   reconciler    └──────────────────────────────────────────────────────────────────┘               ▲
-       └──────── writes ─────────────────────────────────────────────────────────────────────────────────────┘
-                   all services ──OTLP──► otel-collector ──► Grafana LGTM | Azure Application Insights | console
+```mermaid
+flowchart LR
+  subgraph W["WMS (legacy)"]
+    WMS["wms<br/>Spring Boot · :8082"]
+    WDB[("wms-db<br/>PostgreSQL 17")]
+  end
+  subgraph G["Glue (PHP 8.5)"]
+    PROXY["glue · :8090<br/>/erp/* proxy + dashboard"]
+    WORKER["glue-worker<br/>retries · reconciler"]
+    GDB[("glue-db · PostgreSQL 17<br/>jobs · snapshots · conflicts · audit")]
+  end
+  subgraph E["ERP (legacy, system of record)"]
+    ERP["erp<br/>Spring Boot · :8081"]
+    EDB[("erp-db<br/>MySQL 8.4")]
+  end
+  WMS --- WDB
+  ERP --- EDB
+  WMS -- "ERP_BASE_URL<br/>pull every 10 s, write-backs" --> PROXY
+  PROXY -- "reads, inline writes" --> ERP
+  PROXY -- "ERP down: queue, reply 202" --> GDB
+  WORKER -- "claim jobs, save snapshots" --> GDB
+  WORKER -- "retries, merged writes" --> ERP
+  WORKER -- "merged writes" --> WMS
+  WMS -. "direct mode<br/>./switch.sh direct" .-> ERP
 ```
 
 ## Services
@@ -65,13 +78,15 @@ Plain PHP 8.5: PDO, curl and no framework, using PHP 8.5 features such as the pi
 
 ## Getting started
 
+Requires only Docker with Compose v2. JDK, Maven and PHP live inside the images: `erp` and `wms` are built from source by a multi-stage Maven Dockerfile (the OpenTelemetry Java agent is added in the same step), and `glue` is the official `php:8.5-cli` image plus `pdo_pgsql`. CI (`.github/workflows/build.yml`) builds all images and runs the tests on every push.
+
 ```bash
 docker compose up -d --build     # first build downloads Maven deps, ~2-3 min
 open http://localhost:8090       # glue dashboard
 open http://localhost:3300       # Grafana (telemetry)
 ```
 
-Mode and telemetry destination come from `.env`. Change them with `./switch.sh`; don't edit `.env` by hand.
+Mode and telemetry destination come from `.env`. Change them with `./switch.sh`; the only value you edit by hand is the Application Insights connection string.
 
 ## Enabling / disabling the glue service
 
@@ -137,6 +152,34 @@ Because the ERP only accepts full-record writes, the glue always sends *current 
 | Changes behind the APIs' back | The reconciliation sweep compares full data sets, so direct database edits and missed pulls are caught too. |
 | Glue itself down | The WMS's write-backs fail as they did before the glue. The next sweep repairs stock, addresses and shipments. |
 
+A write from the WMS through the glue:
+
+```mermaid
+sequenceDiagram
+  participant W as WMS
+  participant G as glue
+  participant Q as glue-db
+  participant K as glue-worker
+  participant E as ERP
+  W->>G: POST /erp/api/orders/{no}/ship
+  G->>E: POST /api/orders/{no}/ship
+  alt ERP answers 2xx (or 409: already shipped)
+    E-->>G: 200
+    G-->>W: 200
+  else ERP answers 4xx (e.g. order cancelled)
+    E-->>G: 422
+    G-->>W: same code and reason, never retried
+  else ERP down / 5xx / timeout
+    G->>Q: enqueue job (+ traceparent)
+    G-->>W: 202 queued
+    loop backoff 2 s, 4 s ... 60 s, max 6 attempts
+      K->>Q: claim
+      K->>E: retry
+    end
+    K->>Q: done, or dead letter on the dashboard
+  end
+```
+
 ### Operations
 - **Dashboard (`:8090`):** live comparison of both systems, with disagreements highlighted.
 - **Conflicts:** resolve by keeping the ERP or the WMS value. The choice is written to both systems through a retried job.
@@ -146,7 +189,16 @@ Because the ERP only accepts full-record writes, the glue always sends *current 
 
 ## Centralised telemetry
 
-All services send traces, logs and metrics over OpenTelemetry (OTLP) to `otel-collector`. The destination is one switch:
+All services send traces and logs (the Java agents also send JVM and HTTP metrics) over OpenTelemetry (OTLP) to `otel-collector`. The destination is one switch:
+
+```mermaid
+flowchart LR
+  WMS["wms<br/>Java agent"] & ERP["erp<br/>Java agent"] & GP["glue-proxy"] & GW["glue-worker"] -- "OTLP: traces, logs<br/>(+ JVM metrics)" --> C["otel-collector"]
+  C -- "TELEMETRY=local" --> L["Grafana LGTM · :3300"]
+  C -- "TELEMETRY=azure" --> A["Azure Application Insights"]
+  C -- "TELEMETRY=console" --> D["collector log"]
+```
+
 
 ```bash
 ./switch.sh telemetry local     # Grafana LGTM on http://localhost:3300 (Explore → Tempo / Loki)
@@ -198,7 +250,7 @@ docker compose run --rm --no-deps glue php -d zend.assertions=1 tests/merge_test
 ## Layout
 
 ```
-compose.yaml  .env  switch.sh
+compose.yaml  .env  switch.sh  .github/workflows/build.yml
 erp/    Spring Boot app, Dockerfile, db/ seed
 wms/    Spring Boot app, Dockerfile, db/ seed
 glue/   public/index.php (proxy + dashboard) · bin/worker.php · src/sync.php (mapping, merge, queue, reconcile)
